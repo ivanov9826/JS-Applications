@@ -87,8 +87,10 @@
                 'Access-Control-Allow-Origin': '*',
                 'Content-Type': 'application/json'
             };
-            let result;
+            let result = '';
+            let context;
 
+            // NOTE: the OPTIONS method results in undefined result and also it never processes plugins - keep this in mind
             if (method == 'OPTIONS') {
                 Object.assign(headers, {
                     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
@@ -98,7 +100,7 @@
                 });
             } else {
                 try {
-                    const context = processPlugins();
+                    context = processPlugins();
                     await handle(context);
                 } catch (err) {
                     if (err instanceof ServiceError$1) {
@@ -115,6 +117,9 @@
             }
 
             res.writeHead(status, headers);
+            if (context != undefined && context.util != undefined && context.util.throttle) {
+                await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
+            }
             res.end(result);
 
             function processPlugins() {
@@ -130,9 +135,9 @@
                 } else if (serviceName == 'favicon.ico') {
                     return ({ headers, result } = services['favicon'](method, tokens, query, body));
                 }
-                
+
                 const service = services[serviceName];
-                
+
                 if (service === undefined) {
                     status = 400;
                     result = composeErrorObject(400, `Service "${serviceName}" is not supported`);
@@ -276,6 +281,21 @@
 
     var Service_1 = Service;
 
+    function uuid() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+            let r = Math.random() * 16 | 0,
+                v = c == 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+        });
+    }
+
+    var util = {
+        uuid
+    };
+
+    const uuid$1 = util.uuid;
+
+
     const data = fs__default['default'].readdirSync('./data').reduce((p, c) => {
         const content = JSON.parse(fs__default['default'].readFileSync('./data/' + c));
         const collection = c.slice(0, -5);
@@ -310,7 +330,7 @@
                 responseData = responseData[token];
             }
 
-            const newId = uuid();
+            const newId = uuid$1();
             responseData[newId] = Object.assign({}, body, { _id: newId });
             return responseData[newId];
         },
@@ -355,13 +375,6 @@
     dataService.put(':collection', actions.put);
     dataService.delete(':collection', actions.delete);
 
-    function uuid() {
-        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-            let r = Math.random() * 16 | 0,
-                v = c == 'x' ? r : (r & 0x3 | 0x8);
-            return v.toString(16);
-        });
-    }
 
     var jsonstore = dataService.parseRequest;
 
@@ -414,6 +427,50 @@
         }
     }
 
+    function parseWhere(query) {
+        const operators = {
+            '<=': (prop, value) => record => record[prop] <= JSON.parse(value),
+            '<': (prop, value) => record => record[prop] < JSON.parse(value),
+            '>=': (prop, value) => record => record[prop] >= JSON.parse(value),
+            '>': (prop, value) => record => record[prop] > JSON.parse(value),
+            '=': (prop, value) => record => record[prop] == JSON.parse(value),
+            ' like ': (prop, value) => record => record[prop].toLowerCase().includes(JSON.parse(value).toLowerCase()),
+            ' in ': (prop, value) => record => JSON.parse(`[${/\((.+?)\)/.exec(value)[1]}]`).includes(record[prop]),
+        };
+        const pattern = new RegExp(`^(.+?)(${Object.keys(operators).join('|')})(.+?)$`, 'i');
+
+        try {
+            let clauses = [query.trim()];
+            let check = (a, b) => b;
+            let acc = true;
+            if (query.match(/ and /gi)) {
+                // inclusive
+                clauses = query.split(/ and /gi);
+                check = (a, b) => a && b;
+                acc = true;
+            } else if (query.match(/ or /gi)) {
+                // optional
+                clauses = query.split(/ or /gi);
+                check = (a, b) => a || b;
+                acc = false;
+            }
+            clauses = clauses.map(createChecker);
+
+            return (record) => clauses
+                .map(c => c(record))
+                .reduce(check, acc);
+        } catch (err) {
+            throw new Error('Could not parse WHERE clause, check your syntax.');
+        }
+
+        function createChecker(clause) {
+            let [match, prop, operator, value] = pattern.exec(clause);
+            [prop, value] = [prop.trim(), value.trim()];
+
+            return operators[operator.toLowerCase()](prop, value);
+        }
+    }
+
 
     function get(context, tokens, query, body) {
         validateRequest(context, tokens);
@@ -422,13 +479,23 @@
 
         try {
             if (query.where) {
-                const [prop, value] = query.where.split('=');
-                responseData = context.storage.query(context.params.collection, { [prop]: JSON.parse(value) });
+                responseData = context.storage.get(context.params.collection).filter(parseWhere(query.where));
             } else if (context.params.collection) {
                 responseData = context.storage.get(context.params.collection, tokens[0]);
             } else {
                 // Get list of collections
                 return context.storage.get();
+            }
+
+            if (query.distinct) {
+                const props = query.distinct.split(',').filter(p => p != '');
+                responseData = Object.values(responseData.reduce((distinct, c) => {
+                    const key = props.map(p => c[p]).join('::');
+                    if (distinct.hasOwnProperty(key) == false) {
+                        distinct[key] = c;
+                    }
+                    return distinct;
+                }, {}));
             }
 
             if (query.count) {
@@ -465,14 +532,41 @@
 
             if (query.select) {
                 const props = query.select.split(',').filter(p => p != '');
-                responseData = responseData.map(r => {
+                responseData = Array.isArray(responseData) ? responseData.map(transform) : transform(responseData);
+
+                function transform(r) {
                     const result = {};
                     props.forEach(p => result[p] = r[p]);
                     return result;
+                }
+            }
+
+            if (query.load) {
+                const props = query.load.split(',').filter(p => p != '');
+                props.map(prop => {
+                    const [propName, relationTokens] = prop.split('=');
+                    const [idSource, collection] = relationTokens.split(':');
+                    console.log(`Loading related records from "${collection}" into "${propName}", joined on "_id"="${idSource}"`);
+                    const storageSource = collection == 'users' ? context.protectedStorage : context.storage;
+                    responseData = Array.isArray(responseData) ? responseData.map(transform) : transform(responseData);
+
+                    function transform(r) {
+                        const seekId = r[idSource];
+                        const related = storageSource.get(collection, seekId);
+                        delete related.hashedPassword;
+                        r[propName] = related;
+                        return r;
+                    }
                 });
             }
+
         } catch (err) {
-            throw new NotFoundError$1();
+            console.error(err);
+            if (err.message.includes('does not exist')) {
+                throw new NotFoundError$1();
+            } else {
+                throw new RequestError$1(err.message);
+            }
         }
 
         return responseData;
@@ -591,26 +685,66 @@
         };
     };
 
-    //const admin = require('./admin');
+    var require$$0 = "<!DOCTYPE html>\r\n<html lang=\"en\">\r\n<head>\r\n    <meta charset=\"UTF-8\">\r\n    <meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">\r\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\r\n    <title>SUPS Admin Panel</title>\r\n    <style>\r\n        * {\r\n            padding: 0;\r\n            margin: 0;\r\n        }\r\n\r\n        body {\r\n            padding: 32px;\r\n            font-size: 16px;\r\n        }\r\n\r\n        .layout::after {\r\n            content: '';\r\n            clear: both;\r\n            display: table;\r\n        }\r\n\r\n        .col {\r\n            display: block;\r\n            float: left;\r\n        }\r\n\r\n        p {\r\n            padding: 8px 16px;\r\n        }\r\n\r\n        table {\r\n            border-collapse: collapse;\r\n        }\r\n\r\n        caption {\r\n            font-size: 120%;\r\n            text-align: left;\r\n            padding: 4px 8px;\r\n            font-weight: bold;\r\n            background-color: #ddd;\r\n        }\r\n\r\n        table, tr, th, td {\r\n            border: 1px solid #ddd;\r\n        }\r\n\r\n        th, td {\r\n            padding: 4px 8px;\r\n        }\r\n\r\n        ul {\r\n            list-style: none;\r\n        }\r\n\r\n        .collection-list a {\r\n            display: block;\r\n            width: 120px;\r\n            padding: 4px 8px;\r\n            text-decoration: none;\r\n            color: black;\r\n            background-color: #ccc;\r\n        }\r\n        .collection-list a:hover {\r\n            background-color: #ddd;\r\n        }\r\n        .collection-list a:visited {\r\n            color: black;\r\n        }\r\n    </style>\r\n    <script type=\"module\">\nimport { html, render } from 'https://unpkg.com/lit-html?module';\nimport { until } from 'https://unpkg.com/lit-html/directives/until?module';\n\nconst api = {\r\n    async get(url) {\r\n        return json(url);\r\n    },\r\n    async post(url, body) {\r\n        return json(url, {\r\n            method: 'POST',\r\n            headers: { 'Content-Type': 'application/json' },\r\n            body: JSON.stringify(body)\r\n        });\r\n    }\r\n};\r\n\r\nasync function json(url, options) {\r\n    return await (await fetch('/' + url, options)).json();\r\n}\r\n\r\nasync function getCollections() {\r\n    return api.get('data');\r\n}\r\n\r\nasync function getRecords(collection) {\r\n    return api.get('data/' + collection);\r\n}\r\n\r\nasync function getThrottling() {\r\n    return api.get('util/throttle');\r\n}\r\n\r\nasync function setThrottling(throttle) {\r\n    return api.post('util', { throttle });\r\n}\n\nasync function collectionList(onSelect) {\r\n    const collections = await getCollections();\r\n\r\n    return html`\r\n    <ul class=\"collection-list\">\r\n        ${collections.map(collectionLi)}\r\n    </ul>`;\r\n\r\n    function collectionLi(name) {\r\n        return html`<li><a href=\"javascript:void(0)\" @click=${(ev) => onSelect(ev, name)}>${name}</a></li>`;\r\n    }\r\n}\n\nasync function recordTable(collectionName) {\r\n    const records = await getRecords(collectionName);\r\n    const layout = getLayout(records);\r\n\r\n    return html`\r\n    <table>\r\n        <caption>${collectionName}</caption>\r\n        <thead>\r\n            <tr>${layout.map(f => html`<th>${f}</th>`)}</tr>\r\n        </thead>\r\n        <tbody>\r\n            ${records.map(r => recordRow(r, layout))}\r\n        </tbody>\r\n    </table>`;\r\n}\r\n\r\nfunction getLayout(records) {\r\n    const result = new Set(['_id']);\r\n    records.forEach(r => Object.keys(r).forEach(k => result.add(k)));\r\n\r\n    return [...result.keys()];\r\n}\r\n\r\nfunction recordRow(record, layout) {\r\n    return html`\r\n    <tr>\r\n        ${layout.map(f => html`<td>${JSON.stringify(record[f]) || html`<span>(missing)</span>`}</td>`)}\r\n    </tr>`;\r\n}\n\nasync function throttlePanel(display) {\r\n    const active = await getThrottling();\r\n\r\n    return html`\r\n    <p>\r\n        Request throttling: </span>${active}</span>\r\n        <button @click=${(ev) => set(ev, true)}>Enable</button>\r\n        <button @click=${(ev) => set(ev, false)}>Disable</button>\r\n    </p>`;\r\n\r\n    async function set(ev, state) {\r\n        ev.target.disabled = true;\r\n        await setThrottling(state);\r\n        display();\r\n    }\r\n}\n\n//import page from '//unpkg.com/page/page.mjs';\r\n\r\n\r\nfunction start() {\r\n    const main = document.querySelector('main');\r\n    editor(main);\r\n}\r\n\r\nasync function editor(main) {\r\n    let list = html`<div class=\"col\">Loading&hellip;</div>`;\r\n    let viewer = html`<div class=\"col\">\r\n    <p>Select collection to view records</p>\r\n</div>`;\r\n    display();\r\n\r\n    list = html`<div class=\"col\">${await collectionList(onSelect)}</div>`;\r\n    display();\r\n\r\n    async function display() {\r\n        render(html`\r\n        <section class=\"layout\">\r\n            ${until(throttlePanel(display), html`<p>Loading</p>`)}\r\n        </section>\r\n        <section class=\"layout\">\r\n            ${list}\r\n            ${viewer}\r\n        </section>`, main);\r\n    }\r\n\r\n    async function onSelect(ev, name) {\r\n        ev.preventDefault();\r\n        viewer = html`<div class=\"col\">${await recordTable(name)}</div>`;\r\n        display();\r\n    }\r\n}\r\n\r\nstart();\n\n</script>\r\n</head>\r\n<body>\r\n    <main>\r\n        Loading&hellip;\r\n    </main>\r\n</body>\r\n</html>";
+
+    const mode = process.argv[2] == '-dev' ? 'dev' : 'prod';
+
+    const files = {
+        index: mode == 'prod' ? require$$0 : fs__default['default'].readFileSync('./client/index.html', 'utf-8')
+    };
+
+    var admin = (method, tokens, query, body) => {
+        const headers = {
+            'Content-Type': 'text/html'
+        };
+        let result = '';
+
+        const resource = tokens.join('/');
+        if (resource && resource.split('.').pop() == 'js') {
+            headers['Content-Type'] = 'application/javascript';
+
+            files[resource] = files[resource] || fs__default['default'].readFileSync('./client/' + resource, 'utf-8');
+            result = files[resource];
+        } else {
+            result = files.index;
+        }
+
+        return {
+            headers,
+            result
+        };
+    };
+
+    /*
+     * This service requires util plugin
+     */
+
+    const utilService = new Service_1();
+
+    utilService.post('*', onRequest);
+    utilService.get(':service', getStatus);
+
+    function getStatus(context, tokens, query, body) {
+        return context.util[context.params.service];
+    }
+
+    function onRequest(context, tokens, query, body) {
+        Object.entries(body).forEach(([k,v]) => {
+            console.log(`${k} ${v ? 'enabled' : 'disabled'}`);
+            context.util[k] = v;
+        });
+        return '';
+    }
+
+    var util$1 = utilService.parseRequest;
 
     var services = {
         jsonstore,
         users,
         data: data$1,
         favicon,
-        //admin
-    };
-
-    function uuid$1() {
-        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-            let r = Math.random() * 16 | 0,
-                v = c == 'x' ? r : (r & 0x3 | 0x8);
-            return v.toString(16);
-        });
-    }
-
-    var util = {
-        uuid: uuid$1
+        admin,
+        util: util$1
     };
 
     const { uuid: uuid$2 } = util;
@@ -930,6 +1064,18 @@
 
     var auth = initPlugin$1;
 
+    function initPlugin$2(settings) {
+        const util = {
+            throttle: false
+        };
+
+        return function decoreateContext(context, request) {
+            context.util = util;
+        };
+    }
+
+    var util$2 = initPlugin$2;
+
     var identity = "email";
     var protectedData = {
     	users: {
@@ -1003,6 +1149,15 @@
     			_createdOn: 1613551388703
     		}
     	},
+    	comments: {
+    		"0a272c58-b7ea-4e09-a000-7ec988248f66": {
+    			_ownerId: "35c62d76-8152-4626-8712-eeb96381bea8",
+    			content: "Great recipe!",
+    			recipeId: "8f414b4f-ab39-4d36-bedb-2ad69da9c830",
+    			_createdOn: 1614260681375,
+    			_id: "0a272c58-b7ea-4e09-a000-7ec988248f66"
+    		}
+    	},
     	records: {
     		i01: {
     			name: "John1",
@@ -1054,6 +1209,88 @@
     			val: 1,
     			_createdOn: 1613551388793
     		}
+    	},
+    	catches: {
+    		"07f260f4-466c-4607-9a33-f7273b24f1b4": {
+    			_ownerId: "35c62d76-8152-4626-8712-eeb96381bea8",
+    			angler: "Paulo Admorim",
+    			weight: 636,
+    			species: "Atlantic Blue Marlin",
+    			location: "Vitoria, Brazil",
+    			bait: "trolled pink",
+    			captureTime: 80,
+    			_createdOn: 1614760714812,
+    			_id: "07f260f4-466c-4607-9a33-f7273b24f1b4"
+    		},
+    		"bdabf5e9-23be-40a1-9f14-9117b6702a9d": {
+    			_ownerId: "847ec027-f659-4086-8032-5173e2f9c93a",
+    			angler: "John Does",
+    			weight: 554,
+    			species: "Atlantic Blue Marlin",
+    			location: "Buenos Aires, Argentina",
+    			bait: "trolled pink",
+    			captureTime: 120,
+    			_createdOn: 1614760782277,
+    			_id: "bdabf5e9-23be-40a1-9f14-9117b6702a9d"
+    		}
+    	},
+    	furniture: {
+    	},
+    	orders: {
+    	},
+    	movies: {
+    		"1240549d-f0e0-497e-ab99-eb8f703713d7": {
+    			_ownerId: "847ec027-f659-4086-8032-5173e2f9c93a",
+    			title: "Black Widow",
+    			description: "Natasha Romanoff aka Black Widow confronts the darker parts of her ledger when a dangerous conspiracy with ties to her past arises. Comes on the screens 2020.",
+    			img: "https://miro.medium.com/max/735/1*akkAa2CcbKqHsvqVusF3-w.jpeg",
+    			_createdOn: 1614935055353,
+    			_id: "1240549d-f0e0-497e-ab99-eb8f703713d7"
+    		},
+    		"143e5265-333e-4150-80e4-16b61de31aa0": {
+    			_ownerId: "847ec027-f659-4086-8032-5173e2f9c93a",
+    			title: "Wonder Woman 1984",
+    			description: "Diana must contend with a work colleague and businessman, whose desire for extreme wealth sends the world down a path of destruction, after an ancient artifact that grants wishes goes missing.",
+    			img: "https://pbs.twimg.com/media/ETINgKwWAAAyA4r.jpg",
+    			_createdOn: 1614935181470,
+    			_id: "143e5265-333e-4150-80e4-16b61de31aa0"
+    		},
+    		"a9bae6d8-793e-46c4-a9db-deb9e3484909": {
+    			_ownerId: "35c62d76-8152-4626-8712-eeb96381bea8",
+    			title: "Top Gun 2",
+    			description: "After more than thirty years of service as one of the Navy's top aviators, Pete Mitchell is where he belongs, pushing the envelope as a courageous test pilot and dodging the advancement in rank that would ground him.",
+    			img: "https://i.pinimg.com/originals/f2/a4/58/f2a458048757bc6914d559c9e4dc962a.jpg",
+    			_createdOn: 1614935268135,
+    			_id: "a9bae6d8-793e-46c4-a9db-deb9e3484909"
+    		}
+    	},
+    	likes: {
+    	},
+    	ideas: {
+    		"833e0e57-71dc-42c0-b387-0ce0caf5225e": {
+    			_ownerId: "847ec027-f659-4086-8032-5173e2f9c93a",
+    			title: "Best Pilates Workout To Do At Home",
+    			description: "Lorem ipsum dolor, sit amet consectetur adipisicing elit. Minima possimus eveniet ullam aspernatur corporis tempore quia nesciunt nostrum mollitia consequatur. At ducimus amet aliquid magnam nulla sed totam blanditiis ullam atque facilis corrupti quidem nisi iusto saepe, consectetur culpa possimus quos? Repellendus, dicta pariatur! Delectus, placeat debitis error dignissimos nesciunt magni possimus quo nulla, fuga corporis maxime minus nihil doloremque aliquam quia recusandae harum. Molestias dolorum recusandae commodi velit cum sapiente placeat alias rerum illum repudiandae? Suscipit tempore dolore autem, neque debitis quisquam molestias officia hic nesciunt? Obcaecati optio fugit blanditiis, explicabo odio at dicta asperiores distinctio expedita dolor est aperiam earum! Molestias sequi aliquid molestiae, voluptatum doloremque saepe dignissimos quidem quas harum quo. Eum nemo voluptatem hic corrupti officiis eaque et temporibus error totam numquam sequi nostrum assumenda eius voluptatibus quia sed vel, rerum, excepturi maxime? Pariatur, provident hic? Soluta corrupti aspernatur exercitationem vitae accusantium ut ullam dolor quod!",
+    			img: "./images/best-pilates-youtube-workouts-2__medium_4x3.jpg",
+    			_createdOn: 1615033373504,
+    			_id: "833e0e57-71dc-42c0-b387-0ce0caf5225e"
+    		},
+    		"247efaa7-8a3e-48a7-813f-b5bfdad0f46c": {
+    			_ownerId: "847ec027-f659-4086-8032-5173e2f9c93a",
+    			title: "4 Eady DIY Idea To Try!",
+    			description: "Similique rem culpa nemo hic recusandae perspiciatis quidem, quia expedita, sapiente est itaque optio enim placeat voluptates sit, fugit dignissimos tenetur temporibus exercitationem in quis magni sunt vel. Corporis officiis ut sapiente exercitationem consectetur debitis suscipit laborum quo enim iusto, labore, quod quam libero aliquid accusantium! Voluptatum quos porro fugit soluta tempore praesentium ratione dolorum impedit sunt dolores quod labore laudantium beatae architecto perspiciatis natus cupiditate, iure quia aliquid, iusto modi esse!",
+    			img: "./images/brightideacropped.jpg",
+    			_createdOn: 1615033452480,
+    			_id: "247efaa7-8a3e-48a7-813f-b5bfdad0f46c"
+    		},
+    		"b8608c22-dd57-4b24-948e-b358f536b958": {
+    			_ownerId: "35c62d76-8152-4626-8712-eeb96381bea8",
+    			title: "Dinner Recipe",
+    			description: "Consectetur labore et corporis nihil, officiis tempora, hic ex commodi sit aspernatur ad minima? Voluptas nesciunt, blanditiis ex nulla incidunt facere tempora laborum ut aliquid beatae obcaecati quidem reprehenderit consequatur quis iure natus quia totam vel. Amet explicabo quidem repellat unde tempore et totam minima mollitia, adipisci vel autem, enim voluptatem quasi exercitationem dolor cum repudiandae dolores nostrum sit ullam atque dicta, tempora iusto eaque! Rerum debitis voluptate impedit corrupti quibusdam consequatur minima, earum asperiores soluta. A provident reiciendis voluptates et numquam totam eveniet! Dolorum corporis libero dicta laborum illum accusamus ullam?",
+    			img: "./images/dinner.jpg",
+    			_createdOn: 1615033491967,
+    			_id: "b8608c22-dd57-4b24-948e-b358f536b958"
+    		}
     	}
     };
     var settings = {
@@ -1064,7 +1301,8 @@
 
     const plugins = [
         storage(settings),
-        auth(settings)
+        auth(settings),
+        util$2()
     ];
 
     const server = http__default['default'].createServer(requestHandler(plugins, services));
@@ -1072,7 +1310,7 @@
     const port = 3030;
     server.listen(port);
     console.log(`Server started on port ${port}. You can make requests to http://localhost:${port}/`);
-    //console.log(`Admin panel located at http://localhost:${port}/admin`);
+    console.log(`Admin panel located at http://localhost:${port}/admin`);
 
     var softuniPracticeServer = {
 
